@@ -1,0 +1,182 @@
+name: AEP terraform deploy
+description: >
+  Static check (HCL parser) and an azurerm-only Terraform CLI configuration, plan,
+  central Rego policies on that plan, apply exactly that plan with the image digest,
+  then smoke-test /healthz. Used by deploy.yml.
+# Expects aep-governance checked out at `governance-dir` (actions, policies, profiles,
+# scripts, terraform) and the job to export:
+#   ARM_USE_OIDC=true, ARM_USE_AZUREAD=true, ARM_CLIENT_ID, ARM_TENANT_ID, ARM_SUBSCRIPTION_ID
+#   TFSTATE_STORAGE_ACCOUNT, TFSTATE_CONTAINER (variables of the GitHub environment)
+#   TF_VAR_project_slug, TF_VAR_resource_group_name, TF_VAR_container_app_environment_id,
+#   TF_VAR_app_identity_id, TF_VAR_acr_login_server
+
+inputs:
+  environment:
+    description: dev, test or prod (selects infra/env/<environment>.tfvars)
+    required: true
+  image-digest:
+    description: sha256 digest of the image built once in the build job
+    required: true
+  working-directory:
+    description: Terraform root module of the project
+    required: false
+    default: infra
+  state-key:
+    description: Blob name of the state inside the environment's state container
+    required: false
+    default: app.tfstate
+  governance-dir:
+    description: Path of the aep-governance checkout
+    required: false
+    default: .aep-governance
+  profile:
+    description: Rule profile under profiles/
+    required: false
+    default: demo
+
+outputs:
+  app-url:
+    description: Public HTTPS address of the deployed app
+    value: ${{ steps.apply.outputs.app_url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check inputs and environment variables
+      shell: bash
+      env:
+        DIGEST: ${{ inputs.image-digest }}
+      run: |
+        set -euo pipefail
+        missing=""
+        for v in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID TFSTATE_STORAGE_ACCOUNT TFSTATE_CONTAINER \
+                 TF_VAR_project_slug TF_VAR_resource_group_name TF_VAR_container_app_environment_id \
+                 TF_VAR_app_identity_id TF_VAR_acr_login_server; do
+          val="${!v:-}"
+          if [ -z "$val" ] || [ "$val" = "unset" ]; then missing="$missing $v"; fi
+        done
+        if [ -n "$missing" ]; then
+          echo "::error::Missing environment or repository variables:$missing. The project factory sets them; ask the platform team."
+          exit 1
+        fi
+        if ! [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo "::error::image digest '$DIGEST' is not a sha256 digest"
+          exit 1
+        fi
+
+    - name: Governance Terraform settings (CLI config allows only azurerm)
+      shell: bash
+      env:
+        GOV: ${{ inputs.governance-dir }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/tf-plugin-cache"
+        {
+          echo "TF_CLI_CONFIG_FILE=$GITHUB_WORKSPACE/$GOV/terraform/cli.tfrc"
+          echo "TF_PLUGIN_CACHE_DIR=$RUNNER_TEMP/tf-plugin-cache"
+          echo "TF_CLI_ARGS="
+          echo "TF_CLI_ARGS_init="
+          echo "TF_CLI_ARGS_plan="
+          echo "TF_CLI_ARGS_apply="
+          echo "TF_IN_AUTOMATION=1"
+          echo "TF_INPUT=0"
+        } >> "$GITHUB_ENV"
+
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: "0.12.21"
+        enable-cache: false
+
+    - name: Static check of the Terraform configuration (HCL parser, before terraform init)
+      shell: bash
+      working-directory: ${{ runner.temp }}
+      env:
+        GOV: ${{ inputs.governance-dir }}
+        TF_DIR: ${{ inputs.working-directory }}
+      run: |
+        uv run --no-project --no-config \
+          --with-requirements "$GITHUB_WORKSPACE/$GOV/scripts/requirements-hcl.txt" \
+          python "$GITHUB_WORKSPACE/$GOV/scripts/tf_static_check.py" "$GITHUB_WORKSPACE/$TF_DIR"
+
+    - name: Install conftest (pinned version, verified checksum)
+      shell: bash
+      env:
+        CONFTEST_VERSION: "0.56.0"
+        CONFTEST_SHA256: 620f41640d63bbde1646a108ce2816ba54c980466ceebb7e754dda2d508e8cd5
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/aep-conftest"; mkdir -p "$dir"; cd "$dir"
+        curl -fsSL -o conftest.tgz "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+        echo "${CONFTEST_SHA256}  conftest.tgz" | sha256sum -c -
+        tar -xzf conftest.tgz conftest
+
+    - name: terraform init (state of this environment, locked azurerm only)
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        STATE_KEY: ${{ inputs.state-key }}
+      run: |
+        rm -rf .terraform
+        terraform init -input=false -lockfile=readonly \
+          -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+          -backend-config="container_name=${TFSTATE_CONTAINER}" \
+          -backend-config="key=${STATE_KEY}"
+
+    - name: terraform plan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        DIGEST: ${{ inputs.image-digest }}
+        TF_ENV: ${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        # -var after -var-file: values from the GitHub environment win over project tfvars.
+        terraform plan -input=false -out="$RUNNER_TEMP/aep-deploy.tfplan" -var-file="env/${TF_ENV}.tfvars" \
+          -var "project_slug=${TF_VAR_project_slug}" \
+          -var "resource_group_name=${TF_VAR_resource_group_name}" \
+          -var "container_app_environment_id=${TF_VAR_container_app_environment_id}" \
+          -var "app_identity_id=${TF_VAR_app_identity_id}" \
+          -var "acr_login_server=${TF_VAR_acr_login_server}" \
+          -var "image_digest=${DIGEST}"
+        terraform show -json "$RUNNER_TEMP/aep-deploy.tfplan" > "$RUNNER_TEMP/aep-deploy-plan.json"
+
+    - name: Rego policies on this plan (conftest)
+      shell: bash
+      env:
+        GOV: ${{ inputs.governance-dir }}
+        PROFILE: ${{ inputs.profile }}
+      run: |
+        "$RUNNER_TEMP/aep-conftest/conftest" test --no-color \
+          --policy "$GOV/policies/terraform" \
+          --data "$GOV/profiles/${PROFILE}.yaml" \
+          "$RUNNER_TEMP/aep-deploy-plan.json"
+
+    - name: terraform apply (exactly the checked plan)
+      id: apply
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        terraform apply -input=false "$RUNNER_TEMP/aep-deploy.tfplan"
+        echo "app_url=$(terraform output -raw app_url)" >> "$GITHUB_OUTPUT"
+
+    - name: Smoke test /healthz (same digest)
+      shell: bash
+      env:
+        APP_URL: ${{ steps.apply.outputs.app_url }}
+        DIGEST: ${{ inputs.image-digest }}
+      run: |
+        set -uo pipefail
+        # Scale to zero: the first request may wait for a cold start.
+        for attempt in $(seq 1 30); do
+          body=$(curl -fsS --max-time 20 "${APP_URL}/healthz" || true)
+          version=$(printf '%s' "$body" | jq -r '.version // empty' 2>/dev/null || true)
+          if [ "$version" = "$DIGEST" ]; then
+            echo "healthy: ${APP_URL} serves ${DIGEST}"
+            exit 0
+          fi
+          echo "attempt ${attempt}: waiting for ${APP_URL}/healthz to report ${DIGEST} (got '${version}')"
+          sleep 10
+        done
+        echo "::error::${APP_URL}/healthz did not report ${DIGEST} within 5 minutes"
+        exit 1

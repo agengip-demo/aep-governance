@@ -1,0 +1,5 @@
+# Central Trivy configuration. Severity comes from pipeline.vulnerability_fail_level.
+misconfiguration:
+  scanners:
+    - dockerfile
+    - terraform

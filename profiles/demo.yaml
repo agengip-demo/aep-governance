@@ -1,0 +1,57 @@
+# Rule profile of the demo. API, sandbox, factory and workflows read this file;
+# no threshold, list or approver is hard-coded anywhere else.
+profile: pro-code-demo
+agent:
+  allowed: [claude, copilot]
+  default: claude
+  deny_commands:
+    - "git push --force"
+    - "git push -f"
+    - "git push origin main"
+    - "git push origin HEAD:main"
+  protected_paths: [".github/**", "CODEOWNERS", ".github/CODEOWNERS"]
+sandbox:
+  cpus: 2
+  memory_gb: 6
+  pids_limit: 512
+  shm_gb: 1
+  idle_stop_minutes: 60
+  egress_allow:
+    # GitHub
+    - github.com
+    - api.github.com
+    - codeload.github.com
+    - objects.githubusercontent.com
+    - raw.githubusercontent.com
+    - .actions.githubusercontent.com
+    # Claude Code (docs/DECISIONS.md D-001)
+    - api.anthropic.com
+    - claude.ai
+    - platform.claude.com
+    # Package registries
+    - registry.npmjs.org
+    - pypi.org
+    - files.pythonhosted.org
+    - registry.terraform.io
+    - releases.hashicorp.com
+repository:
+  required_approvals: 1
+  required_checks: [test, security, policy, protected-paths, e2e]
+  platform_team: ["ppiliqq"]
+pipeline:
+  coverage_min: 80
+  vulnerability_fail_level: high
+cloud:
+  allowed_locations: [swedencentral]
+  allowed_resource_types:
+    - azurerm_container_app
+    - azurerm_storage_account
+    - azurerm_storage_container
+    - azurerm_key_vault
+    - azurerm_application_insights
+  required_tags: [project, environment, owner, managed-by]
+  max_container_replicas: 2
+  budget_per_env: 20
+approvals:
+  test: ["ppiliqq"]
+  prod: ["ppiliqq"]

@@ -1,0 +1,81 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.16.4",
+  "variables": {
+    "environment": { "value": "dev" },
+    "project_slug": { "value": "demo1" },
+    "image_digest": { "value": "sha256:0000000000000000000000000000000000000000000000000000000000000000" }
+  },
+  "resource_changes": [
+    {
+      "address": "azurerm_container_app.app",
+      "mode": "managed",
+      "type": "azurerm_container_app",
+      "name": "app",
+      "provider_name": "registry.terraform.io/hashicorp/azurerm",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {
+          "name": "ca-demo1-dev",
+          "resource_group_name": "rg-demo1-dev",
+          "container_app_environment_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-demo1-dev/providers/Microsoft.App/managedEnvironments/cae-demo1-dev",
+          "revision_mode": "Single",
+          "tags": {
+            "environment": "dev",
+            "managed-by": "aep",
+            "owner": "octocat",
+            "project": "demo1"
+          },
+          "identity": [
+            {
+              "type": "UserAssigned",
+              "identity_ids": [
+                "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-demo1-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-demo1-dev-app"
+              ]
+            }
+          ],
+          "registry": [
+            {
+              "server": "acraep.azurecr.io",
+              "identity": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-demo1-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-demo1-dev-app",
+              "username": null,
+              "password_secret_name": null
+            }
+          ],
+          "ingress": [
+            {
+              "external_enabled": true,
+              "target_port": 3000,
+              "transport": "auto",
+              "allow_insecure_connections": false,
+              "traffic_weight": [{ "latest_revision": true, "percentage": 100, "label": null, "revision_suffix": null }]
+            }
+          ],
+          "template": [
+            {
+              "min_replicas": 0,
+              "max_replicas": 1,
+              "container": [
+                {
+                  "name": "app",
+                  "image": "acraep.azurecr.io/demo1@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                  "cpu": 0.25,
+                  "memory": "0.5Gi"
+                }
+              ]
+            }
+          ]
+        },
+        "after_unknown": {
+          "id": true,
+          "location": true,
+          "latest_revision_fqdn": true,
+          "latest_revision_name": true,
+          "outbound_ip_addresses": true,
+          "ingress": [{ "fqdn": true }]
+        }
+      }
+    }
+  ]
+}

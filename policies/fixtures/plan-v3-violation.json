@@ -1,0 +1,53 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.16.4",
+  "resource_changes": [
+    {
+      "address": "azurerm_container_app.app",
+      "mode": "managed",
+      "type": "azurerm_container_app",
+      "name": "app",
+      "provider_name": "registry.terraform.io/hashicorp/azurerm",
+      "change": {
+        "actions": ["no-op"],
+        "before": null,
+        "after": {
+          "name": "ca-demo1-dev",
+          "tags": {
+            "environment": "dev",
+            "managed-by": "aep",
+            "owner": "octocat",
+            "project": "demo1"
+          },
+          "template": [{ "min_replicas": 0, "max_replicas": 1 }]
+        },
+        "after_unknown": {}
+      }
+    },
+    {
+      "address": "azurerm_storage_account.exports",
+      "mode": "managed",
+      "type": "azurerm_storage_account",
+      "name": "exports",
+      "provider_name": "registry.terraform.io/hashicorp/azurerm",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {
+          "name": "stdemo1exports",
+          "resource_group_name": "rg-demo1-dev",
+          "location": "eastus",
+          "account_tier": "Standard",
+          "account_replication_type": "LRS",
+          "allow_nested_items_to_be_public": false,
+          "min_tls_version": "TLS1_2",
+          "tags": null
+        },
+        "after_unknown": {
+          "id": true,
+          "primary_blob_endpoint": true
+        }
+      }
+    }
+  ]
+}

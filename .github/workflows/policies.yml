@@ -1,0 +1,41 @@
+# Self-test of this repository: Rego unit tests and the sample plans.
+name: policies
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CONFTEST_VERSION: "0.56.0"
+  CONFTEST_SHA256: 620f41640d63bbde1646a108ce2816ba54c980466ceebb7e754dda2d508e8cd5
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install conftest (pinned version, verified checksum)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o conftest.tgz "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+          echo "${CONFTEST_SHA256}  conftest.tgz" | sha256sum -c -
+          mkdir -p bin && tar -xzf conftest.tgz -C bin conftest
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Rego unit tests
+        run: conftest verify --policy policies/terraform --data profiles
+      - name: Sample plans
+        run: |
+          set -euo pipefail
+          conftest test --policy policies/terraform --data profiles policies/fixtures/plan-template.json
+          if conftest test --policy policies/terraform --data profiles policies/fixtures/plan-v3-violation.json; then
+            echo "::error::plan-v3-violation.json must be rejected"
+            exit 1
+          fi

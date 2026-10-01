@@ -1,0 +1,6 @@
+# Central gitleaks configuration. Projects cannot bring their own config, ignore list
+# or inline allow comments (scripts/scanner_overrides.py, --ignore-gitleaks-allow).
+title = "aep-governance"
+
+[extend]
+useDefault = true

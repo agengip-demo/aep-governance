@@ -1,0 +1,272 @@
+# Reusable delivery pipeline of the AEP platform (SPEC section 8, "Bereitstellung nach dem Merge").
+# Projects call it on every push to main:
+#
+#   jobs:
+#     deploy:
+#       uses: <org>/aep-governance/.github/workflows/deploy.yml@v1
+#
+# build (dev) -> deploy-dev -> deploy-test (approval) -> e2e-test -> deploy-prod (approval).
+# Each deploy job plans, checks the plan with the central Rego policies and applies that plan.
+# The image is built once and promoted by digest. Every job signs in to Azure with the
+# OIDC identity of its own GitHub environment (subject repo:<org>/<slug>:environment:<env>).
+# Terraform state lives per environment in the container named by TFSTATE_CONTAINER.
+name: aep-deploy
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version of the project
+        type: string
+        default: "22"
+      terraform-version:
+        description: Terraform CLI version
+        type: string
+        default: "1.16.4"
+
+permissions: {}
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+  ARM_USE_OIDC: "true"
+  ARM_USE_AZUREAD: "true"
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Azure login with the dev identity (OIDC, AcrPush)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Build the image once and push <slug>:<sha>
+        id: push
+        env:
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+          SLUG: ${{ vars.PROJECT_SLUG }}
+          SHA: ${{ github.sha }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image="${ACR_LOGIN_SERVER}/${SLUG}:${SHA}"
+          az acr login --name "${ACR_LOGIN_SERVER%%.*}"
+          docker build \
+            --label "org.opencontainers.image.revision=${SHA}" \
+            --label "org.opencontainers.image.source=${SOURCE}" \
+            -t "$image" .
+          docker push "$image"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$image" | cut -d@ -f2)
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::could not determine the image digest (got '$digest')"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "### Image" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${ACR_LOGIN_SERVER}/${SLUG}@${digest}\` (tag \`${SHA}\`)" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-dev:
+    name: deploy-dev
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: dev
+      url: ${{ steps.deploy.outputs.app-url }}
+    concurrency:
+      group: aep-deploy-${{ github.repository }}-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+      TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+      TF_VAR_project_slug: ${{ vars.PROJECT_SLUG }}
+      TF_VAR_resource_group_name: ${{ vars.RESOURCE_GROUP }}
+      TF_VAR_container_app_environment_id: ${{ vars.CONTAINER_APP_ENVIRONMENT_ID }}
+      TF_VAR_app_identity_id: ${{ vars.APP_IDENTITY_ID }}
+      TF_VAR_acr_login_server: ${{ vars.ACR_LOGIN_SERVER }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out aep-governance (deploy action, policies, profile, checker)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .aep-governance
+          sparse-checkout: |
+            actions
+            policies
+            profiles
+            scripts
+            terraform
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+      - name: Apply and smoke-test dev
+        id: deploy
+        uses: ./.aep-governance/actions/terraform-deploy
+        with:
+          environment: dev
+          image-digest: ${{ needs.build.outputs.digest }}
+
+  deploy-test:
+    name: deploy-test
+    needs: [build, deploy-dev]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    environment:
+      name: test
+      url: ${{ steps.deploy.outputs.app-url }}
+    outputs:
+      app-url: ${{ steps.deploy.outputs.app-url }}
+    concurrency:
+      group: aep-deploy-${{ github.repository }}-test
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+      TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+      TF_VAR_project_slug: ${{ vars.PROJECT_SLUG }}
+      TF_VAR_resource_group_name: ${{ vars.RESOURCE_GROUP }}
+      TF_VAR_container_app_environment_id: ${{ vars.CONTAINER_APP_ENVIRONMENT_ID }}
+      TF_VAR_app_identity_id: ${{ vars.APP_IDENTITY_ID }}
+      TF_VAR_acr_login_server: ${{ vars.ACR_LOGIN_SERVER }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out aep-governance (deploy action, policies, profile, checker)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .aep-governance
+          sparse-checkout: |
+            actions
+            policies
+            profiles
+            scripts
+            terraform
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+      - name: Apply and smoke-test test (same digest)
+        id: deploy
+        uses: ./.aep-governance/actions/terraform-deploy
+        with:
+          environment: test
+          image-digest: ${{ needs.build.outputs.digest }}
+
+  # End-to-end tests run project code, so they get no cloud credentials.
+  e2e-test:
+    name: e2e-test
+    needs: deploy-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Install the Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: End-to-end tests against the test address
+        env:
+          CI: "true"
+          BASE_URL: ${{ needs.deploy-test.outputs.app-url }}
+        run: npm run test:e2e
+      - name: Keep the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report-test
+          path: playwright-report/
+          retention-days: 7
+
+  deploy-prod:
+    name: deploy-prod
+    needs: [build, e2e-test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: prod
+      url: ${{ steps.deploy.outputs.app-url }}
+    concurrency:
+      group: aep-deploy-${{ github.repository }}-prod
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+      TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+      TF_VAR_project_slug: ${{ vars.PROJECT_SLUG }}
+      TF_VAR_resource_group_name: ${{ vars.RESOURCE_GROUP }}
+      TF_VAR_container_app_environment_id: ${{ vars.CONTAINER_APP_ENVIRONMENT_ID }}
+      TF_VAR_app_identity_id: ${{ vars.APP_IDENTITY_ID }}
+      TF_VAR_acr_login_server: ${{ vars.ACR_LOGIN_SERVER }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out aep-governance (deploy action, policies, profile, checker)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .aep-governance
+          sparse-checkout: |
+            actions
+            policies
+            profiles
+            scripts
+            terraform
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+      - name: Apply and smoke-test prod (same digest)
+        id: deploy
+        uses: ./.aep-governance/actions/terraform-deploy
+        with:
+          environment: prod
+          image-digest: ${{ needs.build.outputs.digest }}

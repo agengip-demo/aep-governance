@@ -1,0 +1,8 @@
+# Governance-controlled Terraform CLI configuration (TF_CLI_CONFIG_FILE) for every
+# pipeline run: only the azurerm provider can be installed, directly from the
+# public registry. No implied local mirrors, no dev_overrides, no other providers.
+provider_installation {
+  direct {
+    include = ["registry.terraform.io/hashicorp/azurerm"]
+  }
+}

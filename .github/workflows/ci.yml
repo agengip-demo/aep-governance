@@ -1,0 +1,483 @@
+# Reusable pull request pipeline of the AEP platform (SPEC section 8, "Pflicht-Checks").
+# Projects call it from .github/workflows/ci.yml:
+#
+#   jobs:
+#     ci:
+#       name: ci
+#       uses: <org>/aep-governance/.github/workflows/ci.yml@v1
+#
+# Required checks (ruleset contexts "ci / <job>"): test, security, policy,
+# protected-paths, e2e. The helper job policy-plan feeds policy and is not required.
+#
+# The project cannot change the checks: thresholds, scanner configuration, policies and
+# checker scripts come from this repository at the commit of this workflow
+# (job.workflow_repository / job.workflow_sha). Project code never runs in a job that
+# can write to the pull request, and Terraform only runs after a static check that
+# allows nothing but the azurerm provider.
+name: aep-ci
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: Rule profile under profiles/ of aep-governance
+        type: string
+        default: demo
+      node-version:
+        description: Node.js version of the project
+        type: string
+        default: "22"
+      terraform-version:
+        description: Terraform CLI version
+        type: string
+        default: "1.16.4"
+
+permissions: {}
+
+env:
+  GOV_DIR: .aep-governance
+  GOV_PROFILE: .aep-governance/profiles/${{ inputs.profile }}.yaml
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  TRIVY_VERSION: "0.74.0"
+  TRIVY_SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+  CONFTEST_VERSION: "0.56.0"
+  CONFTEST_SHA256: 620f41640d63bbde1646a108ce2816ba54c980466ceebb7e754dda2d508e8cd5
+  # Placeholder for the plan in a pull request: the image is built only after the merge.
+  PLAN_IMAGE_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out aep-governance (rule profile)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .aep-governance
+          sparse-checkout: profiles
+          persist-credentials: false
+      - name: Read pipeline.coverage_min (before any project code runs)
+        id: profile
+        run: |
+          set -euo pipefail
+          min=$(yq -r '.pipeline.coverage_min' "$GOV_PROFILE")
+          if ! [[ "$min" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            echo "::error::pipeline.coverage_min is missing or not a number in the rule profile ('$min'). Ask the platform team."
+            exit 1
+          fi
+          echo "coverage_min=$min" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: project/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: project
+      - name: Lint, typecheck, unit tests with coverage
+        working-directory: project
+        env:
+          COVERAGE_MIN: ${{ steps.profile.outputs.coverage_min }}
+        run: |
+          rm -f coverage/coverage-summary.json
+          npm test
+      - name: Enforce pipeline.coverage_min on the coverage summary
+        env:
+          MIN: ${{ steps.profile.outputs.coverage_min }}
+        run: |
+          set -euo pipefail
+          summary=project/coverage/coverage-summary.json
+          if [ ! -f "$summary" ]; then
+            echo "::error::$summary is missing. Required change: npm test must run Vitest with v8 coverage and the json-summary reporter."
+            exit 1
+          fi
+          pct=$(jq -r '.total.lines.pct' "$summary")
+          echo "line coverage ${pct} %, minimum ${MIN} % (pipeline.coverage_min)"
+          if ! awk -v p="$pct" -v m="$MIN" 'BEGIN { exit !(p + 0 >= m + 0) }'; then
+            echo "::error::Line coverage ${pct} % is below pipeline.coverage_min ${MIN} %. Required change: add unit tests under tests/unit/ for the uncovered lines shown above."
+            exit 1
+          fi
+
+  security:
+    name: security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out aep-governance (profile, scanner configuration, checker)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .aep-governance
+          sparse-checkout: |
+            profiles
+            scripts
+            security
+          persist-credentials: false
+      - name: No project-level scanner configuration or suppressions
+        run: python3 "$GOV_DIR/scripts/scanner_overrides.py" .
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Install gitleaks and Trivy (pinned versions, verified checksums)
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"; cd "$RUNNER_TEMP"
+          curl -fsSL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz -C "$bin" gitleaks
+          curl -fsSL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz -C "$bin" trivy
+          echo "$bin" >> "$GITHUB_PATH"
+      - name: Secret scan (gitleaks, central configuration)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Central config, central (empty) ignore list, inline "gitleaks:allow" ignored.
+          opts=(--config "$GOV_DIR/security/gitleaks.toml" --gitleaks-ignore-path "$GOV_DIR/security"
+                --ignore-gitleaks-allow --redact --no-banner --exit-code 1)
+          if [ -n "${BASE_SHA}" ] && [ -n "${HEAD_SHA}" ]; then
+            gitleaks git "${opts[@]}" --log-opts="${BASE_SHA}..${HEAD_SHA}" .
+          else
+            gitleaks git "${opts[@]}" .
+          fi
+          gitleaks dir "${opts[@]}" .
+      - name: Dependencies (npm audit)
+        run: |
+          set -euo pipefail
+          level=$(yq -r '.pipeline.vulnerability_fail_level' "$GOV_PROFILE")
+          # User and global npm config are ignored; a project .npmrc is rejected above.
+          npm_config_userconfig=/dev/null npm_config_globalconfig=/dev/null \
+            npm audit --audit-level="$level" --include=dev --registry=https://registry.npmjs.org/
+      - name: Configuration and Dockerfile (Trivy, central configuration)
+        run: |
+          set -euo pipefail
+          level=$(yq -r '.pipeline.vulnerability_fail_level' "$GOV_PROFILE")
+          case "$level" in
+            low) severity=LOW,MEDIUM,HIGH,CRITICAL ;;
+            moderate|medium) severity=MEDIUM,HIGH,CRITICAL ;;
+            high) severity=HIGH,CRITICAL ;;
+            critical) severity=CRITICAL ;;
+            *) echo "::error::unknown pipeline.vulnerability_fail_level '$level'"; exit 1 ;;
+          esac
+          trivy config --config "$GOV_DIR/security/trivy.yaml" \
+            --ignorefile "$GOV_DIR/security/trivyignore" \
+            --exit-code 1 --severity "$severity" \
+            --skip-dirs "$GOV_DIR" --skip-dirs node_modules .
+
+  # Produces the plan as data. Holds the plan identity (OIDC) but cannot write to the
+  # pull request. Two independent barriers keep project code from running here:
+  # tf_static_check.py (HCL parser, before init) and the governance CLI configuration
+  # (TF_CLI_CONFIG_FILE) that lets terraform install nothing but hashicorp/azurerm.
+  policy-plan:
+    name: policy-plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      plan-sha256: ${{ steps.plan.outputs.sha256 }}
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+      TF_CLI_ARGS: ""
+      TF_CLI_ARGS_init: ""
+      TF_CLI_ARGS_plan: ""
+      TF_CLI_ARGS_validate: ""
+      # Plan identity id-<slug>-plan: Reader on rg-<slug>-dev, Storage Blob Data Reader on its state.
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ vars.PLAN_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      SLUG: ${{ vars.PROJECT_SLUG }}
+    steps:
+      - name: Prepare result folder and Terraform settings (outside the project checkout)
+        run: |
+          mkdir -p "$RUNNER_TEMP/policy-out" "$RUNNER_TEMP/tf-plugin-cache"
+          {
+            echo "OUT=$RUNNER_TEMP/policy-out"
+            echo "TF_CLI_CONFIG_FILE=$GITHUB_WORKSPACE/$GOV_DIR/terraform/cli.tfrc"
+            echo "TF_PLUGIN_CACHE_DIR=$RUNNER_TEMP/tf-plugin-cache"
+          } >> "$GITHUB_ENV"
+      - name: Azure must be configured for this project
+        run: |
+          missing=""
+          for v in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID SLUG; do
+            val="${!v:-}"
+            if [ -z "$val" ] || [ "$val" = "unset" ]; then missing="$missing $v"; fi
+          done
+          if [ -n "$missing" ]; then
+            msg="[policy] Azure is not configured for this repository (missing:$missing; repository variables PLAN_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, PROJECT_SLUG). The policy check needs a Terraform plan against dev. / Azure ist für dieses Repository nicht eingerichtet; der Policy-Check braucht einen Terraform-Plan gegen Dev. Required change: ask the platform team to set up the project with Azure."
+            echo "$msg" | tee -a "$OUT/findings.txt"
+            echo "::error::$msg"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out aep-governance (static checker, Terraform CLI configuration)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .aep-governance
+          sparse-checkout: |
+            scripts
+            terraform
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.21"
+          enable-cache: false
+      - name: Static check of infra/ (HCL parser, before terraform init)
+        # Runs outside the project checkout and ignores uv configuration files there.
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -o pipefail
+          uv run --no-project --no-config \
+            --with-requirements "$GITHUB_WORKSPACE/$GOV_DIR/scripts/requirements-hcl.txt" \
+            python "$GITHUB_WORKSPACE/$GOV_DIR/scripts/tf_static_check.py" "$GITHUB_WORKSPACE/infra" \
+            | tee -a "$OUT/findings.txt"
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+      - name: terraform fmt -check
+        working-directory: infra
+        run: |
+          if ! terraform fmt -check -recursive -no-color > "$RUNNER_TEMP/fmt.txt"; then
+            echo "[policy] infra: Terraform files are not formatted: $(tr '\n' ' ' < "$RUNNER_TEMP/fmt.txt") Required change: run 'terraform -chdir=infra fmt -recursive' and commit the result." | tee -a "$OUT/findings.txt"
+            exit 1
+          fi
+      - name: terraform init, validate and plan against dev (read-only, no state lock)
+        id: plan
+        working-directory: infra
+        env:
+          TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+          # Pull request jobs have no access to the dev environment's variables;
+          # the names follow the factory's naming scheme (SPEC section 6).
+          V_PROJECT_SLUG: ${{ vars.PROJECT_SLUG }}
+          V_RESOURCE_GROUP: rg-${{ vars.PROJECT_SLUG }}-dev
+          V_CAE_ID: /subscriptions/${{ vars.AZURE_SUBSCRIPTION_ID }}/resourceGroups/rg-${{ vars.PROJECT_SLUG }}-dev/providers/Microsoft.App/managedEnvironments/cae-${{ vars.PROJECT_SLUG }}-dev
+          V_APP_IDENTITY_ID: /subscriptions/${{ vars.AZURE_SUBSCRIPTION_ID }}/resourceGroups/rg-${{ vars.PROJECT_SLUG }}-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-${{ vars.PROJECT_SLUG }}-dev-app
+          V_ACR: ${{ vars.ACR_LOGIN_SERVER }}
+        run: |
+          set -uo pipefail
+          step() {
+            if ! "$@" -no-color > "$RUNNER_TEMP/tf.txt" 2>&1; then
+              cat "$RUNNER_TEMP/tf.txt"
+              { echo "[policy] infra: terraform $2 failed:"; tail -n 40 "$RUNNER_TEMP/tf.txt"; } >> "$OUT/findings.txt"
+              exit 1
+            fi
+            cat "$RUNNER_TEMP/tf.txt"
+          }
+          rm -rf .terraform
+          step terraform init -lockfile=readonly \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=tfstate-${SLUG}-dev" \
+            -backend-config="key=app.tfstate"
+          step terraform validate
+          # -var after -var-file: governance values win over the project's tfvars.
+          step terraform plan -lock=false -out="$RUNNER_TEMP/tfplan" -var-file=env/dev.tfvars \
+            -var "project_slug=${V_PROJECT_SLUG}" \
+            -var "resource_group_name=${V_RESOURCE_GROUP}" \
+            -var "container_app_environment_id=${V_CAE_ID}" \
+            -var "app_identity_id=${V_APP_IDENTITY_ID}" \
+            -var "acr_login_server=${V_ACR}" \
+            -var "image_digest=${PLAN_IMAGE_DIGEST}"
+          terraform show -json "$RUNNER_TEMP/tfplan" > "$OUT/plan.json" || exit 1
+          echo "sha256=$(sha256sum "$OUT/plan.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Hand the result to the policy job
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: policy-plan
+          path: ${{ runner.temp }}/policy-out/
+          if-no-files-found: ignore
+          retention-days: 3
+
+  # Evaluates the plan with the central policies. Runs no project code: it checks out
+  # only aep-governance and reads the plan as data. It may comment on the pull request.
+  policy:
+    name: policy
+    needs: policy-plan
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Check out aep-governance (policies and rule profile)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .aep-governance
+          sparse-checkout: |
+            profiles
+            policies
+          persist-credentials: false
+      - name: Fetch the plan
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: policy-plan
+          path: ${{ runner.temp }}/policy-in
+      - name: Install conftest (pinned version, verified checksum)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o conftest.tgz "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+          echo "${CONFTEST_SHA256}  conftest.tgz" | sha256sum -c -
+          mkdir -p bin && tar -xzf conftest.tgz -C bin conftest
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Rego policies on the plan (conftest)
+        id: evaluate
+        env:
+          PLAN_RESULT: ${{ needs.policy-plan.result }}
+          PLAN_SHA256: ${{ needs.policy-plan.outputs.plan-sha256 }}
+        run: |
+          set -uo pipefail
+          in="$RUNNER_TEMP/policy-in"
+          report="$RUNNER_TEMP/report.txt"
+          if [ "$PLAN_RESULT" = "success" ] && [ -s "$in/plan.json" ]; then
+            actual=$(sha256sum "$in/plan.json" | cut -d' ' -f1)
+            if [ -z "$PLAN_SHA256" ] || [ "$actual" != "$PLAN_SHA256" ]; then
+              echo "[policy] the plan artifact does not match the plan produced by policy-plan (sha256 $actual, expected ${PLAN_SHA256:-none}). Required change: re-run the checks; ask the platform team if this repeats." | tee "$report"
+              exit 1
+            fi
+          fi
+          if [ "$PLAN_RESULT" != "success" ] || [ ! -s "$in/plan.json" ]; then
+            if [ -s "$in/findings.txt" ]; then
+              cp "$in/findings.txt" "$report"
+            else
+              echo "[policy] the plan could not be produced (policy-plan: $PLAN_RESULT). Required change: open the policy-plan job log and fix the error." > "$report"
+            fi
+            cat "$report"
+            exit 1
+          fi
+          conftest test --no-color \
+            --policy "$GOV_DIR/policies/terraform" \
+            --data "$GOV_PROFILE" \
+            "$in/plan.json" > "$report" 2>&1
+          rc=$?
+          cat "$report"
+          exit "$rc"
+      - name: Post the policy result as pull request comment
+        if: failure() && steps.evaluate.outcome == 'failure' && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/comment.md"
+          {
+            echo "### Policy check failed"
+            echo
+            echo "The Terraform configuration or its plan for **dev** violates the platform rules. Each line names the resource, the rule and the required change."
+            echo
+            echo '```text'
+            grep -E '^(FAIL|WARN|\[)' "$RUNNER_TEMP/report.txt" || head -c 60000 "$RUNNER_TEMP/report.txt"
+            echo '```'
+          } > "$body"
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$body"
+
+  protected-paths:
+    name: protected-paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out aep-governance (rule profile and checker)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .aep-governance
+          sparse-checkout: |
+            profiles
+            scripts
+          persist-credentials: false
+      - name: Compare changed files with agent.protected_paths
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OPENER: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "not a pull request: nothing to compare"
+            exit 0
+          fi
+          yq -o=json '.' "$GOV_PROFILE" > "$RUNNER_TEMP/profile.json"
+          # The opener and the GitHub login of every commit author in the pull request
+          # (a commit without a linked account counts as an unknown author).
+          args=(--author "$OPENER")
+          while IFS= read -r login; do
+            args+=(--author "$login")
+          done < <(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" --jq '.[] | (.author.login // "")')
+          git diff --name-only "${BASE_SHA}...${HEAD_SHA}" \
+            | python3 "$GOV_DIR/scripts/protected_paths.py" \
+                --profile-json "$RUNNER_TEMP/profile.json" "${args[@]}"
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Install the Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Build, start and test the app (Playwright)
+        env:
+          CI: "true"
+        run: npm run test:e2e
+      - name: Keep the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
