@@ -165,7 +165,9 @@ jobs:
           set -euo pipefail
           level=$(yq -r '.pipeline.vulnerability_fail_level' "$GOV_PROFILE")
           # User and global npm config are ignored; a project .npmrc is rejected above.
-          npm_config_userconfig=/dev/null npm_config_globalconfig=/dev/null \
+          # Two distinct empty files: npm refuses the same path for both levels.
+          empty_user=$(mktemp); empty_global=$(mktemp)
+          npm_config_userconfig="$empty_user" npm_config_globalconfig="$empty_global" \
             npm audit --audit-level="$level" --include=dev --registry=https://registry.npmjs.org/
       - name: Configuration and Dockerfile (Trivy, central configuration)
         run: |
