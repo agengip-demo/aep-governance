@@ -24,6 +24,9 @@ sandbox:
     - objects.githubusercontent.com
     - raw.githubusercontent.com
     - .actions.githubusercontent.com
+    # `gh run view --log-failed` downloads job logs from GitHub's result storage accounts
+    # (docs/DECISIONS.md D-012); a regex limited to that account family, not *.blob.core.windows.net.
+    - ~^productionresultssa[0-9][0-9]?\.blob\.core\.windows\.net$
     # Claude Code (docs/DECISIONS.md D-001)
     - api.anthropic.com
     - claude.ai
